@@ -57,7 +57,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (error) throw error;
     } else if (action === "update-item") {
       if (!id || !name) return res.status(400).json({ error: "Datos inválidos" });
-      const { error } = await db.from("catalog_items").update({ name, updated_at: new Date().toISOString() }).eq("id", id).eq("company_id", company.id);
+      const categoryId = String(body.categoryId ?? "");
+      if (!categoryId) return res.status(400).json({ error: "El deporte es obligatorio" });
+      const { error } = await db.from("catalog_items").update({ name, category_id: categoryId, active: Boolean(body.active), updated_at: new Date().toISOString() }).eq("id", id).eq("company_id", company.id);
       if (error) throw error;
     } else if (action === "toggle-item" || action === "sort-item") {
       const values = action === "toggle-item" ? { active: Boolean(body.active), updated_at: new Date().toISOString() } : { sort_order: Number(body.sortOrder), updated_at: new Date().toISOString() };

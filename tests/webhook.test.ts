@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import webhook from "../api/webhook.js";
+import { createWebhookHandler } from "../api/webhook.js";
 
 function responseMock() {
   const response = { statusCode: 0, body: undefined as unknown, status: vi.fn(), send: vi.fn(), json: vi.fn() };
@@ -21,7 +21,17 @@ function requestMock(method: string, options: { query?: Record<string, string>; 
 
 describe("WhatsApp webhook", () => {
   const secret = "test-app-secret";
+  let processPayload: ReturnType<typeof vi.fn>;
+  let deferred: Promise<unknown>[];
+  let webhook: ReturnType<typeof createWebhookHandler>;
+
   beforeEach(() => { process.env.WHATSAPP_VERIFY_TOKEN = "verify-token"; process.env.META_APP_SECRET = secret; });
+
+  beforeEach(() => {
+    processPayload = vi.fn().mockResolvedValue(undefined);
+    deferred = [];
+    webhook = createWebhookHandler({ processPayload, defer: (work) => deferred.push(work) });
+  });
 
   it("verifies Meta subscriptions", async () => {
     const response = responseMock();
@@ -38,9 +48,11 @@ describe("WhatsApp webhook", () => {
   it("accepts a signed text message", async () => {
     const body = JSON.stringify({ entry: [{ changes: [{ field: "messages", value: { metadata: { phone_number_id: "414146038441176" }, messages: [{ from: "59167889020", id: "wamid.1", timestamp: "1", type: "text", text: { body: "Hola" } }] } }] }] });
     const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-    const response = responseMock(); const log = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const response = responseMock();
     await webhook(requestMock("POST", { body, signature }) as never, response as never);
-    expect(response.statusCode).toBe(200); expect(log).toHaveBeenCalledWith("whatsapp_message_received", expect.objectContaining({ body: "Hola", type: "text" }));
+    await Promise.all(deferred);
+    expect(response.statusCode).toBe(200);
+    expect(processPayload).toHaveBeenCalledWith(JSON.parse(body));
   });
 
   it("rejects an invalid signature", async () => {

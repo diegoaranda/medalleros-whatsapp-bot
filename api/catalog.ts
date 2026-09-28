@@ -12,6 +12,27 @@ function payload(req: VercelRequest) {
   return (req.body ?? {}) as Record<string, unknown>;
 }
 
+function codePrefixFor(slug: string) {
+  const letters = slug.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 3);
+  return letters || "GEN";
+}
+
+async function generateItemCode(db: ReturnType<typeof getSupabaseAdmin>, companyId: string, categorySlug: string) {
+  const prefix = codePrefixFor(categorySlug);
+  const { data: existing, error } = await db
+    .from("catalog_items")
+    .select("code")
+    .eq("company_id", companyId)
+    .like("code", `${prefix}-%`);
+  if (error) throw error;
+  const maxSeq = (existing ?? []).reduce((max, row) => {
+    const match = /^-(\d+)$/.exec(row.code.slice(prefix.length));
+    const value = match ? Number(match[1]) : 0;
+    return Number.isFinite(value) && value > max ? value : max;
+  }, 0);
+  return `${prefix}-${String(maxSeq + 1).padStart(2, "0")}`;
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const company = await getAdminCompany();
@@ -19,7 +40,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (req.method === "GET") {
       const [{ data: categories, error: categoryError }, { data: items, error: itemError }] = await Promise.all([
         db.from("catalog_categories").select("id,name,slug,active,sort_order").eq("company_id", company.id).order("sort_order").order("name"),
-        db.from("catalog_items").select("id,category_id,name,active,sort_order,metadata").eq("company_id", company.id).order("sort_order").order("name")
+        db.from("catalog_items").select("id,category_id,name,code,active,sort_order,metadata").eq("company_id", company.id).order("sort_order").order("name")
       ]);
       if (categoryError || itemError) throw categoryError ?? itemError;
       const itemIds = (items ?? []).map((item) => item.id);
@@ -53,8 +74,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } else if (action === "create-item") {
       const categoryId = String(body.categoryId ?? "");
       if (!name || !categoryId) return res.status(400).json({ error: "Modelo y deporte son obligatorios" });
-      const { error } = await db.from("catalog_items").insert({ company_id: company.id, category_id: categoryId, name, sort_order: Number(body.sortOrder ?? 0) });
-      if (error) throw error;
+      const { data: category, error: categoryError } = await db.from("catalog_categories").select("slug").eq("id", categoryId).eq("company_id", company.id).maybeSingle();
+      if (categoryError || !category) return res.status(400).json({ error: "Deporte no encontrado" });
+      let insertError: { code?: string; message: string } | null = null;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const code = await generateItemCode(db, company.id, category.slug);
+        const result = await db.from("catalog_items").insert({ company_id: company.id, category_id: categoryId, name, code, sort_order: Number(body.sortOrder ?? 0) });
+        insertError = result.error;
+        if (!insertError || insertError.code !== "23505") break;
+      }
+      if (insertError) throw insertError;
     } else if (action === "update-item") {
       if (!id || !name) return res.status(400).json({ error: "Datos inválidos" });
       const categoryId = String(body.categoryId ?? "");

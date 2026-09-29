@@ -52,7 +52,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const { data } = await db.storage.from("catalog-media").createSignedUrl(entry.storage_path, 3600);
         return { ...entry, url: data?.signedUrl ?? null };
       }));
-      return res.status(200).json({ company, categories: categories ?? [], items: items ?? [], media: signedMedia });
+      const categoryIds = (categories ?? []).map((category) => category.id);
+      const { data: categoryMedia, error: categoryMediaError } = categoryIds.length
+        ? await db.from("catalog_category_media").select("id,category_id,code,storage_path,sort_order").in("category_id", categoryIds).order("sort_order")
+        : { data: [], error: null };
+      if (categoryMediaError) throw categoryMediaError;
+      const signedCategoryMedia = await Promise.all((categoryMedia ?? []).map(async (entry) => {
+        const { data } = await db.storage.from("catalog-media").createSignedUrl(entry.storage_path, 3600);
+        return { ...entry, url: data?.signedUrl ?? null };
+      }));
+      return res.status(200).json({ company, categories: categories ?? [], items: items ?? [], media: signedMedia, categoryMedia: signedCategoryMedia });
     }
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
     const body = payload(req);

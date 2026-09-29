@@ -25,6 +25,10 @@ export interface IngestedMessageContext {
   channelExternalId: string;
   channelCredentialEnvKey: string;
   senderExternalId: string;
+  /** conversations.last_message_at as it was BEFORE this inbound message was
+   * ingested, i.e. the timestamp of the conversation's prior activity.
+   * Undefined/null when this is the conversation's first ever message. */
+  previousLastMessageAt?: string | null;
 }
 
 export type OutboundAction =

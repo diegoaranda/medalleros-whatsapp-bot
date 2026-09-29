@@ -10,6 +10,7 @@ interface IngestRow {
   message_id: string | null;
   automation_status: "active" | "paused_human";
   credential_env_key: string;
+  previous_last_message_at: string | null;
 }
 
 export class SupabaseAutomationRepository implements AutomationRepository {
@@ -41,7 +42,8 @@ export class SupabaseAutomationRepository implements AutomationRepository {
       automationStatus: row.automation_status,
       channelExternalId: message.channelExternalId,
       channelCredentialEnvKey: row.credential_env_key,
-      senderExternalId: message.senderExternalId
+      senderExternalId: message.senderExternalId,
+      previousLastMessageAt: row.previous_last_message_at
     };
   }
 

@@ -28,6 +28,8 @@ export interface IntakeVariables {
   sportSlug?: string;
   sportName?: string;
   selectedCode?: string;
+  /** Set by the integration layer once a selection is persisted, never by step() itself. */
+  imageId?: string;
 }
 
 export interface IntakeContext {
@@ -41,17 +43,47 @@ export interface IntakeStepResult {
   replies: string[];
 }
 
+/** Lowercases, strips accents and common punctuation, and collapses
+ * whitespace, so matching is insensitive to case/tildes/¿?¡!.,; and extra
+ * spaces. Shared by sport and FAQ resolution. */
 export function normalize(text: string): string {
-  return text.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+  return text
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase()
+    .replace(/[¿?¡!.,;:()"'`]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function containsWholeWord(haystack: string, needle: string): boolean {
+/** True when `needle` (a single word or a multi-word phrase) appears in
+ * `haystack` at word/phrase boundaries — never as a bare substring of an
+ * unrelated word (e.g. "envio" must not match inside "reenvioso"). Both
+ * strings are expected to already be normalize()d. No fuzzy matching. */
+export function containsWholeWord(haystack: string, needle: string): boolean {
   if (!needle) return false;
   return new RegExp(`(^|[^a-z0-9])${escapeRegExp(needle)}([^a-z0-9]|$)`).test(haystack);
+}
+
+/** The longest of `terms` (already normalize()d) that matches `norm` (also
+ * already normalize()d), either as the whole message or as a whole
+ * word/phrase within it — or null if none match. Used both to pick the most
+ * specific match among several candidate terms (sport, FAQ alias) and, by
+ * the multi-intent resolver in intake-runner.ts, to estimate how much of a
+ * message a deterministic match actually accounts for. */
+export function bestMatchingTerm(norm: string, terms: string[]): string | null {
+  let best: string | null = null;
+  for (const term of terms) {
+    if (!term) continue;
+    if (term === norm || containsWholeWord(norm, term)) {
+      if (!best || term.length > best.length) best = term;
+    }
+  }
+  return best;
 }
 
 /**
@@ -91,6 +123,16 @@ function render(template: string, vars: Record<string, string>): string {
   return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) => vars[key] ?? "");
 }
 
+/** The WAITING_FOR_SPORT -> WAITING_FOR_SELECTION transition, factored out
+ * so both the deterministic step() below and the AI-classifier fallback
+ * (see resolveIntakeTurn in intake-runner.ts) apply the exact same
+ * transition once a sport has been identified, by whichever means. */
+export function applySportSelection(variables: IntakeVariables, sport: CatalogSport, messages: IntakeMessages): IntakeStepResult {
+  const nextVariables: IntakeVariables = { ...variables, sportSlug: sport.slug, sportName: sport.name };
+  const reply = render(messages.sportRecognized, { sport: sport.name, catalog_url: sport.catalogUrl ?? "" });
+  return { state: "WAITING_FOR_SELECTION", variables: nextVariables, replies: [reply] };
+}
+
 /**
  * Deterministic, side-effect-free state machine for the initial WhatsApp
  * intake conversation. SHOWING_OPTIONS is the transient state while the
@@ -112,9 +154,7 @@ export function step(state: IntakeState, variables: IntakeVariables, input: stri
   if (state === "WAITING_FOR_SPORT") {
     const sport = resolveSport(input, sports);
     if (!sport) return { state: "WAITING_FOR_SPORT", variables, replies: [messages.sportNotRecognized] };
-    const nextVariables: IntakeVariables = { ...variables, sportSlug: sport.slug, sportName: sport.name };
-    const reply = render(messages.sportRecognized, { sport: sport.name, catalog_url: sport.catalogUrl ?? "" });
-    return { state: "WAITING_FOR_SELECTION", variables: nextVariables, replies: [reply] };
+    return applySportSelection(variables, sport, messages);
   }
 
   if (state === "WAITING_FOR_SELECTION") {

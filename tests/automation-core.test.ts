@@ -9,7 +9,23 @@ import type {
   OutboundTarget
 } from "../src/core/types.js";
 import { FlowEngine } from "../src/flows/engine.js";
+import type { IntakeAutomationGateway } from "../src/flows/intake-runner.js";
 import { processWhatsAppWebhook } from "../src/application/process-webhook.js";
+
+// The Fase 1 automation-core tests below exercise the generic FlowEngine
+// only; they inject an inactive no-op intake gateway so processWhatsAppWebhook
+// never falls back to a real Supabase-backed gateway (which would require
+// live credentials) and never sends automated replies of its own.
+const noopIntakeGateway: IntakeAutomationGateway = {
+  getFlowConfig: async () => null,
+  getActiveFaqs: async () => [],
+  getCatalogSports: async () => ({ sports: [], imageIdByCode: new Map() }),
+  getLatestExecution: async () => null,
+  createExecution: async () => {},
+  updateExecution: async () => {},
+  pauseConversation: async () => {},
+  resumeConversation: async () => {}
+};
 
 const baseMessage: NormalizedInboundMessage = {
   provider: "whatsapp",
@@ -85,8 +101,8 @@ describe("automation core", () => {
     const adapter = adapterMock();
     vi.spyOn(console, "info").mockImplementation(() => undefined);
 
-    await processWhatsAppWebhook(payload("wamid.same"), { repository, adapter });
-    await processWhatsAppWebhook(payload("wamid.same"), { repository, adapter });
+    await processWhatsAppWebhook(payload("wamid.same"), { repository, adapter, intakeGateway: noopIntakeGateway });
+    await processWhatsAppWebhook(payload("wamid.same"), { repository, adapter, intakeGateway: noopIntakeGateway });
 
     expect(repository.messageIds.size).toBe(1);
     expect(adapter.sendText).toHaveBeenCalledTimes(1);
@@ -97,8 +113,8 @@ describe("automation core", () => {
     const adapter = adapterMock();
     vi.spyOn(console, "info").mockImplementation(() => undefined);
 
-    await processWhatsAppWebhook(payload("wamid.first", "1790553600"), { repository, adapter });
-    await processWhatsAppWebhook(payload("wamid.second", "1790553660"), { repository, adapter });
+    await processWhatsAppWebhook(payload("wamid.first", "1790553600"), { repository, adapter, intakeGateway: noopIntakeGateway });
+    await processWhatsAppWebhook(payload("wamid.second", "1790553660"), { repository, adapter, intakeGateway: noopIntakeGateway });
 
     expect(repository.conversations.size).toBe(1);
     expect(repository.conversations.values().next().value?.lastMessageAt).toBe("2026-09-28T00:01:00.000Z");

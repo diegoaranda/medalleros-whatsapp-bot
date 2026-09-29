@@ -6,6 +6,7 @@
     { "source": "/conversations", "destination": "/api/admin?page=conversations" },
     { "source": "/automations", "destination": "/api/admin?page=automations" },
     { "source": "/catalog", "destination": "/api/admin?page=catalog" },
+    { "source": "/catalogo/:sport", "destination": "/api/public/catalog-page?sport=:sport" },
     { "source": "/library", "destination": "/api/admin?page=library" },
     { "source": "/settings", "destination": "/api/admin?page=settings" }
   ]

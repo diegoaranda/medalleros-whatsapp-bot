@@ -1,0 +1,139 @@
+export type IntakeState = "NEW" | "WAITING_FOR_SPORT" | "SHOWING_OPTIONS" | "WAITING_FOR_SELECTION" | "HUMAN_HANDOFF";
+
+export interface IntakeMessages {
+  greeting: string;
+  sportRecognized: string;
+  sportNotRecognized: string;
+  modelSelected: string;
+  handoff: string;
+}
+
+export const DEFAULT_INTAKE_MESSAGES: IntakeMessages = {
+  greeting: "Hola 👋 ¿Qué deporte estás buscando?",
+  sportRecognized: "Tenemos estos diseños de {{sport}} 👇\n{{catalog_url}}",
+  sportNotRecognized: "¿Qué deporte estás buscando?",
+  modelSelected: "Perfecto 🙌 elegiste el {{code}}.",
+  handoff: "Ya te ayudamos con el modelo 😊 ahora te atendemos personalmente para precio y detalles."
+};
+
+export interface CatalogSport {
+  slug: string;
+  name: string;
+  codes: string[];
+  aliases?: string[];
+  catalogUrl?: string;
+}
+
+export interface IntakeVariables {
+  sportSlug?: string;
+  sportName?: string;
+  selectedCode?: string;
+}
+
+export interface IntakeContext {
+  messages: IntakeMessages;
+  sports: CatalogSport[];
+}
+
+export interface IntakeStepResult {
+  state: IntakeState;
+  variables: IntakeVariables;
+  replies: string[];
+}
+
+export function normalize(text: string): string {
+  return text.normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().trim();
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function containsWholeWord(haystack: string, needle: string): boolean {
+  if (!needle) return false;
+  return new RegExp(`(^|[^a-z0-9])${escapeRegExp(needle)}([^a-z0-9]|$)`).test(haystack);
+}
+
+/**
+ * Resolves a sport purely from data supplied by the caller: each sport's own
+ * slug, name and aliases (loaded dynamically from Catálogo). There is no
+ * hardcoded sport list here, so a newly created category with its own
+ * aliases is recognized automatically, with no code change or deploy.
+ * Matching is exact-token / whole-word only (no fuzzy/typo-tolerant logic).
+ */
+export function resolveSport(input: string, sports: CatalogSport[]): CatalogSport | null {
+  const norm = normalize(input);
+  if (!norm) return null;
+
+  const termsBySport = sports.map((sport) => ({
+    sport,
+    terms: [sport.slug, sport.name, ...(sport.aliases ?? [])].map(normalize).filter(Boolean)
+  }));
+
+  for (const { sport, terms } of termsBySport) {
+    if (terms.includes(norm)) return sport;
+  }
+  for (const { sport, terms } of termsBySport) {
+    if (terms.some((term) => containsWholeWord(norm, term))) return sport;
+  }
+  return null;
+}
+
+const CODE_PATTERN = /[A-Za-z]{2,4}-\d{1,4}/;
+
+export function resolveCode(input: string, validCodes: string[]): string | null {
+  const match = input.toUpperCase().match(CODE_PATTERN);
+  if (!match) return null;
+  return validCodes.includes(match[0]) ? match[0] : null;
+}
+
+function render(template: string, vars: Record<string, string>): string {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key: string) => vars[key] ?? "");
+}
+
+/**
+ * Deterministic, side-effect-free state machine for the initial WhatsApp
+ * intake conversation. SHOWING_OPTIONS is the transient state while the
+ * options message is composed; a single step settles directly into
+ * WAITING_FOR_SELECTION once the sport is recognized, since there is no
+ * asynchronous gap between "show options" and "wait for reply" here.
+ */
+export function step(state: IntakeState, variables: IntakeVariables, input: string, context: IntakeContext): IntakeStepResult {
+  const { messages, sports } = context;
+
+  if (state === "HUMAN_HANDOFF") {
+    return { state, variables, replies: [] };
+  }
+
+  if (state === "NEW") {
+    return { state: "WAITING_FOR_SPORT", variables, replies: [messages.greeting] };
+  }
+
+  if (state === "WAITING_FOR_SPORT") {
+    const sport = resolveSport(input, sports);
+    if (!sport) return { state: "WAITING_FOR_SPORT", variables, replies: [messages.sportNotRecognized] };
+    const nextVariables: IntakeVariables = { ...variables, sportSlug: sport.slug, sportName: sport.name };
+    const reply = render(messages.sportRecognized, { sport: sport.name, catalog_url: sport.catalogUrl ?? "" });
+    return { state: "WAITING_FOR_SELECTION", variables: nextVariables, replies: [reply] };
+  }
+
+  if (state === "WAITING_FOR_SELECTION") {
+    const sport = sports.find((candidate) => candidate.slug === variables.sportSlug);
+    const code = sport ? resolveCode(input, sport.codes) : null;
+    if (!code) return { state, variables, replies: ["No reconocí ese código. Revisa el que aparece bajo la foto que te interesa."] };
+    const nextVariables: IntakeVariables = { ...variables, selectedCode: code };
+    return { state: "HUMAN_HANDOFF", variables: nextVariables, replies: [render(messages.modelSelected, { code }), messages.handoff] };
+  }
+
+  return { state, variables, replies: [] };
+}
+
+/** Maps a step result onto the Fase 1 flow_executions row shape, ready for
+ * when this connects to real conversations (current_node_id + variables). */
+export function toExecutionRow(result: Pick<IntakeStepResult, "state" | "variables">) {
+  return { current_node_id: result.state, variables: result.variables };
+}
+
+export function fromExecutionRow(row: { current_node_id: string | null; variables: Record<string, unknown> | null }): { state: IntakeState; variables: IntakeVariables } {
+  return { state: (row.current_node_id as IntakeState) ?? "NEW", variables: (row.variables ?? {}) as IntakeVariables };
+}

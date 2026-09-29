@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getAdminCompany } from "../src/admin/company.js";
 import { getSupabaseAdmin } from "../src/db/supabase.js";
+import { normalize } from "../src/flows/whatsapp-intake.js";
 
 function slugify(value: string) {
   return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim()
@@ -38,11 +39,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const company = await getAdminCompany();
     const db = getSupabaseAdmin();
     if (req.method === "GET") {
-      const [{ data: categories, error: categoryError }, { data: items, error: itemError }] = await Promise.all([
+      const [{ data: categories, error: categoryError }, { data: items, error: itemError }, { data: aliasRows, error: aliasError }] = await Promise.all([
         db.from("catalog_categories").select("id,name,slug,active,sort_order").eq("company_id", company.id).order("sort_order").order("name"),
-        db.from("catalog_items").select("id,category_id,name,code,active,sort_order,metadata").eq("company_id", company.id).order("sort_order").order("name")
+        db.from("catalog_items").select("id,category_id,name,code,active,sort_order,metadata").eq("company_id", company.id).order("sort_order").order("name"),
+        db.from("catalog_category_aliases").select("id,category_id,alias").eq("company_id", company.id).order("alias")
       ]);
-      if (categoryError || itemError) throw categoryError ?? itemError;
+      if (categoryError || itemError || aliasError) throw categoryError ?? itemError ?? aliasError;
+      const aliasesByCategory = new Map<string, { id: string; alias: string }[]>();
+      for (const row of aliasRows ?? []) {
+        const list = aliasesByCategory.get(row.category_id) ?? [];
+        list.push({ id: row.id, alias: row.alias });
+        aliasesByCategory.set(row.category_id, list);
+      }
+      const categoriesWithAliases = (categories ?? []).map((category) => ({ ...category, aliases: aliasesByCategory.get(category.id) ?? [] }));
       const itemIds = (items ?? []).map((item) => item.id);
       const { data: media, error: mediaError } = itemIds.length
         ? await db.from("catalog_item_media").select("id,item_id,storage_path,sort_order").in("item_id", itemIds).order("sort_order")
@@ -61,7 +70,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         const { data } = await db.storage.from("catalog-media").createSignedUrl(entry.storage_path, 3600);
         return { ...entry, url: data?.signedUrl ?? null };
       }));
-      return res.status(200).json({ company, categories: categories ?? [], items: items ?? [], media: signedMedia, categoryMedia: signedCategoryMedia });
+      return res.status(200).json({ company, categories: categoriesWithAliases, items: items ?? [], media: signedMedia, categoryMedia: signedCategoryMedia });
     }
     if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
     const body = payload(req);
@@ -102,6 +111,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     } else if (action === "toggle-item" || action === "sort-item") {
       const values = action === "toggle-item" ? { active: Boolean(body.active), updated_at: new Date().toISOString() } : { sort_order: Number(body.sortOrder), updated_at: new Date().toISOString() };
       const { error } = await db.from("catalog_items").update(values).eq("id", id).eq("company_id", company.id);
+      if (error) throw error;
+    } else if (action === "add-alias") {
+      const categoryId = String(body.categoryId ?? "");
+      const rawAlias = typeof body.alias === "string" ? body.alias.trim() : "";
+      const normalized = normalize(rawAlias);
+      if (!categoryId || !rawAlias || !normalized) return res.status(400).json({ error: "Alias inválido" });
+
+      const { data: companyCategories, error: categoriesError } = await db.from("catalog_categories").select("id,name,slug").eq("company_id", company.id);
+      if (categoriesError) throw categoriesError;
+      const category = (companyCategories ?? []).find((c) => c.id === categoryId);
+      if (!category) return res.status(404).json({ error: "Deporte no encontrado" });
+
+      const collidesWithSport = (companyCategories ?? []).some((c) => normalize(c.name) === normalized || normalize(c.slug) === normalized);
+      if (collidesWithSport) return res.status(400).json({ error: "Ese alias coincide con el nombre de un deporte existente" });
+
+      const { data: existingAliases, error: aliasFetchError } = await db.from("catalog_category_aliases").select("alias").eq("company_id", company.id);
+      if (aliasFetchError) throw aliasFetchError;
+      if ((existingAliases ?? []).some((a) => normalize(a.alias) === normalized)) {
+        return res.status(400).json({ error: "Ese alias ya está en uso por otro deporte" });
+      }
+
+      const { error: insertError } = await db.from("catalog_category_aliases").insert({ company_id: company.id, category_id: categoryId, alias: rawAlias, alias_normalized: normalized });
+      if (insertError) return res.status(400).json({ error: "No se pudo agregar el alias" });
+    } else if (action === "remove-alias") {
+      if (!id) return res.status(400).json({ error: "Alias inválido" });
+      const { error } = await db.from("catalog_category_aliases").delete().eq("id", id).eq("company_id", company.id);
       if (error) throw error;
     } else return res.status(400).json({ error: "Acción no soportada" });
     return res.status(204).end();

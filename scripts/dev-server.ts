@@ -100,6 +100,30 @@ function splitDestination(destination: string) {
   return { pathname, query };
 }
 
+function compileSource(source: string) {
+  const paramNames: string[] = [];
+  const pattern = source.replace(/:([A-Za-z0-9_]+)/g, (_match, name: string) => {
+    paramNames.push(name);
+    return "([^/]+)";
+  });
+  return { regex: new RegExp(`^${pattern}$`), paramNames };
+}
+
+function matchRewrite(rewrite: Rewrite, pathname: string): Record<string, string> | null {
+  const { regex, paramNames } = compileSource(rewrite.source);
+  const match = regex.exec(pathname);
+  if (!match) return null;
+  const params: Record<string, string> = {};
+  paramNames.forEach((name, index) => {
+    params[name] = decodeURIComponent(match[index + 1]);
+  });
+  return params;
+}
+
+function applyParams(template: string, params: Record<string, string>) {
+  return template.replace(/:([A-Za-z0-9_]+)/g, (_match, name: string) => params[name] ?? "");
+}
+
 async function loadHandlerModule(apiPathname: string) {
   const relative = apiPathname.replace(/^\/api\//, "");
   const modulePath = join(rootDir, "api", `${relative}.ts`);
@@ -117,11 +141,14 @@ const server = createServer(async (req, res) => {
     const query: Record<string, string> = {};
     for (const [key, value] of url.searchParams) query[key] = value;
 
-    const rewrite = rewrites.find((r) => r.source === pathname);
-    if (rewrite) {
-      const destination = splitDestination(rewrite.destination);
+    const originalQuery = { ...query };
+    for (const candidate of rewrites) {
+      const params = matchRewrite(candidate, pathname);
+      if (!params) continue;
+      const destination = splitDestination(applyParams(candidate.destination, params));
       pathname = destination.pathname;
-      Object.assign(query, destination.query, query);
+      Object.assign(query, destination.query, params, originalQuery);
+      break;
     }
 
     if (!pathname.startsWith("/api/")) {
@@ -164,5 +191,5 @@ const server = createServer(async (req, res) => {
 const port = Number(process.env.PORT ?? 3000);
 server.listen(port, () => {
   console.log(`Servidor local listo en http://localhost:${port}`);
-  console.log("Rutas: / /conversations /automations /catalog /library /settings /api/health /api/catalog /api/webhook");
+  console.log("Rutas: / /conversations /automations /catalog /library /settings /catalogo/:sport /api/health /api/catalog /api/webhook");
 });

@@ -53,7 +53,7 @@ export class SupabaseAutomationRepository implements AutomationRepository {
       .select("id,company_id,conversation_id,status,runtime_state")
       .eq("conversation_id", conversationId)
       .eq("status", "waiting_reply")
-      .order("created_at", { ascending: true })
+      .order("started_at", { ascending: true })
       .limit(1)
       .maybeSingle();
     if (error) throw new Error(`Waiting execution lookup failed: ${error.message}`);

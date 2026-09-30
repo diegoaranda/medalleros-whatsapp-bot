@@ -138,6 +138,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!id) return res.status(400).json({ error: "Alias inválido" });
       const { error } = await db.from("catalog_category_aliases").delete().eq("id", id).eq("company_id", company.id);
       if (error) throw error;
+    } else if (action === "update-settings") {
+      const template = typeof body.catalogPrefillTemplate === "string" ? body.catalogPrefillTemplate.trim() : "";
+      if (template && !template.includes("{{code}}")) return res.status(400).json({ error: "El texto debe incluir {{code}}" });
+      const { error } = await db.from("companies").update({ catalog_prefill_template: template || null }).eq("id", company.id);
+      if (error) throw error;
     } else return res.status(400).json({ error: "Acción no soportada" });
     return res.status(204).end();
   } catch (error) {

@@ -14,6 +14,12 @@ export interface AutomationFaq {
    * applies, especially when title/aliases alone are ambiguous. The
    * deterministic resolver below never reads it. */
   classifierDescription?: string | null;
+  /** Fase 8 (Media V1): 0..N images attached to this FAQ, already resolved
+   * to a publicly-fetchable URL (Meta needs a plain link, not a signed one)
+   * and ordered by the admin-configured sort order. The deterministic
+   * resolver below never reads it — only resolveIntakeTurn does, to build
+   * the image replies that follow the FAQ's text. */
+  media?: { url: string; sortOrder: number }[];
 }
 
 /**

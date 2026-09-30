@@ -48,16 +48,30 @@ export class SupabaseIntakeAutomationGateway implements IntakeAutomationGateway 
     if (faqError) throw new Error(`FAQ lookup failed: ${faqError.message}`);
     const faqIds = (faqs ?? []).map((faq) => faq.id);
 
-    const { data: aliasRows, error: aliasError } = faqIds.length
-      ? await this.client.from("automation_faq_aliases").select("faq_id,alias").in("faq_id", faqIds)
-      : { data: [], error: null };
+    const [{ data: aliasRows, error: aliasError }, { data: mediaRows, error: mediaError }] = faqIds.length
+      ? await Promise.all([
+          this.client.from("automation_faq_aliases").select("faq_id,alias").in("faq_id", faqIds),
+          this.client.from("automation_faq_media").select("faq_id,storage_path,sort_order").in("faq_id", faqIds).order("sort_order")
+        ])
+      : [{ data: [], error: null }, { data: [], error: null }];
     if (aliasError) throw new Error(`FAQ alias lookup failed: ${aliasError.message}`);
+    if (mediaError) throw new Error(`FAQ media lookup failed: ${mediaError.message}`);
 
     const aliasesByFaq = new Map<string, string[]>();
     for (const row of aliasRows ?? []) {
       const list = aliasesByFaq.get(row.faq_id) ?? [];
       list.push(row.alias);
       aliasesByFaq.set(row.faq_id, list);
+    }
+    // FAQ media (Fase 8) lives in a public bucket for the same reason
+    // catalog media does — Meta must be able to fetch the link directly, no
+    // signed URL generated at send time.
+    const mediaByFaq = new Map<string, { url: string; sortOrder: number }[]>();
+    for (const row of mediaRows ?? []) {
+      const { data } = this.client.storage.from("automation-media").getPublicUrl(row.storage_path);
+      const list = mediaByFaq.get(row.faq_id) ?? [];
+      list.push({ url: data.publicUrl, sortOrder: row.sort_order });
+      mediaByFaq.set(row.faq_id, list);
     }
 
     return (faqs ?? []).map((faq) => ({
@@ -66,11 +80,12 @@ export class SupabaseIntakeAutomationGateway implements IntakeAutomationGateway 
       answer: faq.answer,
       classifierDescription: faq.classifier_description,
       aliases: aliasesByFaq.get(faq.id) ?? [],
-      sortOrder: faq.sort_order
+      sortOrder: faq.sort_order,
+      media: mediaByFaq.get(faq.id) ?? []
     }));
   }
 
-  async getCatalogSports(companyId: string): Promise<{ sports: CatalogSport[]; imageIdByCode: Map<string, string> }> {
+  async getCatalogSports(companyId: string): Promise<{ sports: CatalogSport[]; imageIdByCode: Map<string, string>; imageUrlByCode: Map<string, string> }> {
     const { data: categories, error: categoryError } = await this.client
       .from("catalog_categories")
       .select("id,slug,name")
@@ -83,7 +98,7 @@ export class SupabaseIntakeAutomationGateway implements IntakeAutomationGateway 
     const categoryIds = (categories ?? []).map((category) => category.id);
     const [{ data: media, error: mediaError }, { data: aliasRows, error: aliasError }] = categoryIds.length
       ? await Promise.all([
-          this.client.from("catalog_category_media").select("id,category_id,code").in("category_id", categoryIds).order("sort_order"),
+          this.client.from("catalog_category_media").select("id,category_id,code,storage_path").in("category_id", categoryIds).order("sort_order"),
           this.client.from("catalog_category_aliases").select("category_id,alias").in("category_id", categoryIds)
         ])
       : [{ data: [], error: null }, { data: [], error: null }];
@@ -92,11 +107,16 @@ export class SupabaseIntakeAutomationGateway implements IntakeAutomationGateway 
 
     const codesByCategory = new Map<string, string[]>();
     const imageIdByCode = new Map<string, string>();
+    // Fase 8: reuse the catalog's own public image directly for the WhatsApp
+    // reply — never re-uploaded or copied into another bucket/path.
+    const imageUrlByCode = new Map<string, string>();
     for (const entry of media ?? []) {
       const list = codesByCategory.get(entry.category_id) ?? [];
       list.push(entry.code);
       codesByCategory.set(entry.category_id, list);
       imageIdByCode.set(entry.code, entry.id);
+      const { data } = this.client.storage.from("catalog-media").getPublicUrl(entry.storage_path);
+      imageUrlByCode.set(entry.code, data.publicUrl);
     }
     const aliasesByCategory = new Map<string, string[]>();
     for (const entry of aliasRows ?? []) {
@@ -114,7 +134,7 @@ export class SupabaseIntakeAutomationGateway implements IntakeAutomationGateway 
       catalogUrl: `${baseUrl}/catalogo/${category.slug}`
     }));
 
-    return { sports, imageIdByCode };
+    return { sports, imageIdByCode, imageUrlByCode };
   }
 
   async getLatestExecution(flowVersionId: string, conversationId: string): Promise<IntakeExecution | null> {

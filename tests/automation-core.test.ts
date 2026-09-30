@@ -19,7 +19,7 @@ import { processWhatsAppWebhook } from "../src/application/process-webhook.js";
 const noopIntakeGateway: IntakeAutomationGateway = {
   getFlowConfig: async () => null,
   getActiveFaqs: async () => [],
-  getCatalogSports: async () => ({ sports: [], imageIdByCode: new Map() }),
+  getCatalogSports: async () => ({ sports: [], imageIdByCode: new Map(), imageUrlByCode: new Map() }),
   getLatestExecution: async () => null,
   createExecution: async () => {},
   updateExecution: async () => {},

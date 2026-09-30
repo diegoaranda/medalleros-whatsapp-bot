@@ -3,12 +3,18 @@ import { getAdminCompany } from "../../src/admin/company.js";
 import { getSupabaseAdmin } from "../../src/db/supabase.js";
 
 const WHATSAPP_NUMBER = "59167889020";
+const DEFAULT_PREFILL_TEMPLATE = "Me interesa este diseño: {{code}}";
 
 const esc = (value: string | null | undefined) =>
   (value ?? "").replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char] ?? char);
 
-function whatsappUrl(code: string) {
-  return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(`Hola, me interesa el diseño ${code}`)}`;
+/** Fase 8: the WhatsApp prefill text is admin-configurable (Automatizaciones
+ * → Catálogo), defaulting to "Me interesa este diseño: {{code}}" — no more
+ * "Hola" since the customer picking a design from this page is very likely
+ * already mid-conversation with the bot/Jhoselin. */
+function whatsappUrl(code: string, template: string) {
+  const text = (template.includes("{{code}}") ? template : DEFAULT_PREFILL_TEMPLATE).replace(/\{\{code\}\}/g, code);
+  return `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(text)}`;
 }
 
 function page(title: string, body: string) {
@@ -64,11 +70,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return { code: entry.code, url: data.publicUrl };
     });
 
+    const prefillTemplate = company.catalog_prefill_template || DEFAULT_PREFILL_TEMPLATE;
     const grid = images.length
       ? `<div class="grid">${images
           .map(
             (image) =>
-              `<article class="card"><div class="photo"><img src="${esc(image.url)}" alt="${esc(category.name)} ${esc(image.code)}" loading="lazy"></div><a class="cta" href="${esc(whatsappUrl(image.code))}" target="_blank" rel="noreferrer">Elegir · ${esc(image.code)}</a></article>`
+              `<article class="card"><div class="photo"><img src="${esc(image.url)}" alt="${esc(category.name)} ${esc(image.code)}" loading="lazy"></div><a class="cta" href="${esc(whatsappUrl(image.code, prefillTemplate))}" target="_blank" rel="noreferrer">Elegir · ${esc(image.code)}</a></article>`
           )
           .join("")}</div>`
       : `<div class="empty">Todavía no hay fotos disponibles para ${esc(category.name)}.</div>`;

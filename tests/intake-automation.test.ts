@@ -39,7 +39,7 @@ function payload(id: string, text: string, unixSeconds: number = BASE_UNIX_SECON
 }
 
 const sports: CatalogSport[] = [
-  { slug: "running", name: "Running", codes: ["RUN-01", "RUN-08"], aliases: ["runner", "runer", "correr"], catalogUrl: "https://medalleros-whatsapp-bot.vercel.app/catalogo/running" }
+  { slug: "running", name: "Running", codes: ["RUN-01", "RUN-08", "RUN-14", "RUN-21"], aliases: ["runner", "runer", "correr"], catalogUrl: "https://medalleros-whatsapp-bot.vercel.app/catalogo/running" }
 ];
 
 /** In-memory stand-in for the ingest RPC, mirroring what Fase 1's real
@@ -89,6 +89,11 @@ class FakeIntakeGateway implements IntakeAutomationGateway {
   messages: IntakeMessages = DEFAULT_INTAKE_MESSAGES;
   sports: CatalogSport[] = sports;
   imageIdByCode = new Map<string, string>([["RUN-08", "image-run-08"]]);
+  imageUrlByCode = new Map<string, string>([
+    ["RUN-08", "https://example.test/catalog-media/RUN-08.jpg"],
+    ["RUN-14", "https://example.test/catalog-media/RUN-14.jpg"],
+    ["RUN-21", "https://example.test/catalog-media/RUN-21.jpg"]
+  ]);
   failConfig = false;
   private executions = new Map<string, IntakeExecution>();
   private nextId = 1;
@@ -113,7 +118,7 @@ class FakeIntakeGateway implements IntakeAutomationGateway {
   }
 
   async getCatalogSports(_companyId: string) {
-    return { sports: this.sports, imageIdByCode: this.imageIdByCode };
+    return { sports: this.sports, imageIdByCode: this.imageIdByCode, imageUrlByCode: this.imageUrlByCode };
   }
 
   async getLatestExecution(_flowVersionId: string, conversationId: string) {
@@ -148,7 +153,7 @@ class FakeIntakeGateway implements IntakeAutomationGateway {
   }
 }
 
-function adapterMock(): ChannelAdapter & { sendText: ReturnType<typeof vi.fn> } {
+function adapterMock(): ChannelAdapter & { sendText: ReturnType<typeof vi.fn>; sendImage: ReturnType<typeof vi.fn> } {
   return {
     sendText: vi.fn(async (_target: OutboundTarget, _text: string) => "wamid.out"),
     sendImage: vi.fn(async () => "wamid.out"),
@@ -194,39 +199,43 @@ describe("whatsapp intake automation integration", () => {
     expect(secondReply).toContain("/catalogo/running");
   });
 
-  it("D. selecting a design reaches HUMAN_HANDOFF and persists the selection", async () => {
+  it("D. selecting a design is a silent per-message handoff (Fase 7): persists the selection, zero bot replies, conversation stays live", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
 
     await processWhatsAppWebhook(payload("wamid.1", "Hola"), { repository, adapter, intakeGateway: gateway });
     await processWhatsAppWebhook(payload("wamid.2", "runer"), { repository, adapter, intakeGateway: gateway });
+    const callsBefore = adapter.sendText.mock.calls.length;
     await processWhatsAppWebhook(payload("wamid.3", "Hola, me interesa el diseño RUN-08"), { repository, adapter, intakeGateway: gateway });
 
     const execution = gateway.executionFor("conversation-1");
-    expect(execution?.state).toBe("HUMAN_HANDOFF");
-    expect(execution?.status).toBe("completed");
+    // Fase 7: handoff never persists "HUMAN_HANDOFF" as the flow state, and
+    // never pauses the conversation — sport context stays alive.
+    expect(execution?.state).toBe("WAITING_FOR_SELECTION");
+    expect(execution?.status).toBe("running");
     expect(execution?.variables.selectedCode).toBe("RUN-08");
     expect(execution?.variables.imageId).toBe("image-run-08");
-    expect(gateway.pausedConversations).toContain("conversation-1");
+    expect(gateway.pausedConversations).not.toContain("conversation-1");
+    expect(adapter.sendText.mock.calls.length).toBe(callsBefore); // zero new replies for this message
   });
 
-  it("E. after handoff, further messages get zero automated replies", async () => {
+  it("E. after a selection handoff, a NEW message with a resolvable FAQ still answers automatically (Fase 7 per-message handoff)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [{ id: "faq-envios", title: "Envíos", answer: "Sí, hacemos envíos.", aliases: ["hacen envios"], sortOrder: 0, active: true }];
     const adapter = adapterMock();
 
     await processWhatsAppWebhook(payload("wamid.1", "Hola"), { repository, adapter, intakeGateway: gateway });
     await processWhatsAppWebhook(payload("wamid.2", "runer"), { repository, adapter, intakeGateway: gateway });
     await processWhatsAppWebhook(payload("wamid.3", "Hola, me interesa el diseño RUN-08"), { repository, adapter, intakeGateway: gateway });
-    // Handoff already marked the conversation paused_human via the gateway
-    // (same table the real ingest RPC reads), well within the 48h window.
-    expect(repository.automationStatus).toBe("paused_human");
+    expect(repository.automationStatus).toBe("active"); // never paused
 
     const callsBefore = adapter.sendText.mock.calls.length;
-    await processWhatsAppWebhook(payload("wamid.4", "hola de nuevo"), { repository, adapter, intakeGateway: gateway });
+    await processWhatsAppWebhook(payload("wamid.4", "hacen envios?"), { repository, adapter, intakeGateway: gateway });
 
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
+    expect(adapter.sendText.mock.calls.length).toBe(callsBefore + 1);
+    expect(adapter.sendText.mock.calls[callsBefore]?.[1]).toBe("Sí, hacemos envíos.");
   });
 
   it("F. a duplicated webhook delivery never runs the automation twice", async () => {
@@ -254,91 +263,11 @@ describe("whatsapp intake automation integration", () => {
   });
 });
 
-describe("HUMAN_HANDOFF auto-expiry (48h of conversation inactivity)", () => {
-  const HANDOFF_AT = BASE_UNIX_SECONDS + 120; // "Hola" at +0s, "runer" at +60s, selection at +120s
-
-  async function reachHandoff(repository: MemoryRepository, gateway: FakeIntakeGateway, adapter: ChannelAdapter & { sendText: ReturnType<typeof vi.fn> }) {
-    await processWhatsAppWebhook(payload("wamid.1", "Hola", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
-    await processWhatsAppWebhook(payload("wamid.2", "runer", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
-    await processWhatsAppWebhook(payload("wamid.3", "Hola, me interesa el diseño RUN-08", HANDOFF_AT), { repository, adapter, intakeGateway: gateway });
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-  }
-
-  it("A. still paused after 10h of inactivity: zero replies, stays paused_human", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    await reachHandoff(repository, gateway, adapter);
-
-    const callsBefore = adapter.sendText.mock.calls.length;
-    await processWhatsAppWebhook(payload("wamid.4", "hola", HANDOFF_AT + 10 * 3600), { repository, adapter, intakeGateway: gateway });
-
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
-    expect(repository.automationStatus).toBe("paused_human");
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-  });
-
-  it("B. still paused at 47h59m: zero replies", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    await reachHandoff(repository, gateway, adapter);
-
-    const callsBefore = adapter.sendText.mock.calls.length;
-    await processWhatsAppWebhook(payload("wamid.4", "hola", HANDOFF_AT + 47 * 3600 + 59 * 60), { repository, adapter, intakeGateway: gateway });
-
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
-    expect(repository.automationStatus).toBe("paused_human");
-  });
-
-  it("C. at 48h+ of inactivity: starts a new session and processes the inbound message", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    await reachHandoff(repository, gateway, adapter);
-
-    const callsBefore = adapter.sendText.mock.calls.length;
-    await processWhatsAppWebhook(payload("wamid.4", "Hola", HANDOFF_AT + 48 * 3600), { repository, adapter, intakeGateway: gateway });
-
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore + 1); // the fresh greeting reply
-    expect(repository.automationStatus).toBe("active");
-    expect(gateway.resumedConversations).toContain("conversation-1");
-    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
-  });
-
-  it("D. the new session does not retain the previous sport/code/imageId", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    await reachHandoff(repository, gateway, adapter);
-    expect(gateway.executionFor("conversation-1")?.variables.selectedCode).toBe("RUN-08");
-
-    await processWhatsAppWebhook(payload("wamid.4", "Hola", HANDOFF_AT + 48 * 3600), { repository, adapter, intakeGateway: gateway });
-
-    const variables = gateway.executionFor("conversation-1")?.variables;
-    expect(variables?.sportSlug).toBeUndefined();
-    expect(variables?.selectedCode).toBeUndefined();
-    expect(variables?.imageId).toBeUndefined();
-  });
-
-  it("E. a message during the window still counts as activity, resetting the 48h clock", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    await reachHandoff(repository, gateway, adapter);
-
-    // +10h: within the window, no reply, but this message IS the new "last activity".
-    await processWhatsAppWebhook(payload("wamid.4", "hola", HANDOFF_AT + 10 * 3600), { repository, adapter, intakeGateway: gateway });
-    const callsAfterFirstSilentMessage = adapter.sendText.mock.calls.length;
-
-    // +50h from the original handoff, but only +40h from wamid.4 -> must still stay silent.
-    await processWhatsAppWebhook(payload("wamid.5", "hola", HANDOFF_AT + 50 * 3600), { repository, adapter, intakeGateway: gateway });
-
-    expect(adapter.sendText.mock.calls.length).toBe(callsAfterFirstSilentMessage);
-    expect(repository.automationStatus).toBe("paused_human");
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-  });
-});
+// Fase 7 removed the 48h pause/expiry mechanism from the active flow: a
+// selection handoff no longer pauses the conversation at all, so there is
+// nothing left to "expire" — see the "Fase 7: per-message handoff" describe
+// block below for the coverage that replaces this (bot and human answering
+// consecutive messages in the same conversation, no waiting required).
 
 describe("FAQ layer (transversal over the state machine)", () => {
   const envioFaq = { id: "faq-envios", answer: "Sí, realizamos envíos a todo el país.", aliases: ["envio", "hacen envios"], sortOrder: 0, active: true };
@@ -387,7 +316,7 @@ describe("FAQ layer (transversal over the state machine)", () => {
     expect(gateway.executionFor("conversation-1")?.variables.sportSlug).toBe("running");
   });
 
-  it("D. after an FAQ answer, selecting a design still reaches HUMAN_HANDOFF", async () => {
+  it("D. after an FAQ answer, selecting a design is still a silent per-message handoff (Fase 7)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     gateway.faqs = [envioFaq];
@@ -399,11 +328,11 @@ describe("FAQ layer (transversal over the state machine)", () => {
     await processWhatsAppWebhook(payload("wamid.4", "Hola, me interesa el diseño RUN-08", BASE_UNIX_SECONDS + 180), { repository, adapter, intakeGateway: gateway });
 
     const execution = gateway.executionFor("conversation-1");
-    expect(execution?.state).toBe("HUMAN_HANDOFF");
+    expect(execution?.state).toBe("WAITING_FOR_SELECTION"); // conversation stays live, not a terminal node
     expect(execution?.variables.selectedCode).toBe("RUN-08");
   });
 
-  it("E. an inactive FAQ never answers", async () => {
+  it("E. an inactive FAQ never answers; with nothing else resolvable, it's a silent handoff that keeps the flow state", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     gateway.faqs = [{ ...envioFaq, active: false }];
@@ -413,12 +342,11 @@ describe("FAQ layer (transversal over the state machine)", () => {
     await processWhatsAppWebhook(payload("wamid.2", "¿Hacen envíos?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
 
     expect(adapter.sendText.mock.calls[1]?.[1]).not.toBe(envioFaq.answer);
-    // Fase 6: with no sport recognized either and nothing else resolvable,
-    // this is now a fail-safe UNKNOWN -> HUMAN_HANDOFF transfer instead of
-    // the old canned "not recognized" retry message. Fase 6.1: the handoff
-    // is silent — no transfer message is sent at all.
+    // Fase 7: with no sport recognized either and nothing else resolvable,
+    // this is a silent per-message handoff — zero replies for THIS message
+    // — but the flow state stays WAITING_FOR_SPORT, never a terminal node.
     expect(adapter.sendText.mock.calls.length).toBe(1); // only the "Hola" greeting from message 1
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
   });
 
   it("F. an alias that is only a substring of an unrelated word never matches", async () => {
@@ -452,7 +380,7 @@ describe("FAQ layer (transversal over the state machine)", () => {
     expect(replies).toEqual([envioFaq.answer, pagoFaq.answer]); // both answered, most specific/lowest sortOrder first
   });
 
-  it("H. paused_human (HUMAN_HANDOFF, unexpired): FAQ never answers", async () => {
+  it("H. after a selection handoff, an FAQ in a later message answers normally (Fase 7: no pause)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     gateway.faqs = [envioFaq];
@@ -461,12 +389,13 @@ describe("FAQ layer (transversal over the state machine)", () => {
     await processWhatsAppWebhook(payload("wamid.1", "Hola", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
     await processWhatsAppWebhook(payload("wamid.2", "running", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
     await processWhatsAppWebhook(payload("wamid.3", "Hola, me interesa el diseño RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
-    expect(repository.automationStatus).toBe("paused_human");
+    expect(repository.automationStatus).toBe("active"); // never paused
 
     const callsBefore = adapter.sendText.mock.calls.length;
     await processWhatsAppWebhook(payload("wamid.4", "¿Hacen envíos?", BASE_UNIX_SECONDS + 180), { repository, adapter, intakeGateway: gateway });
 
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
+    expect(adapter.sendText.mock.calls.length).toBe(callsBefore + 1);
+    expect(adapter.sendText.mock.calls[callsBefore]?.[1]).toBe(envioFaq.answer);
   });
 
   it("I. automation globally INACTIVA: FAQ never answers", async () => {
@@ -648,7 +577,7 @@ describe("multi-intent resolution + GPT classifier fallback (Fase 5)", () => {
     expect(gateway.executionFor("conversation-1")?.variables.sportSlug).toBe("running");
   });
 
-  it("K. completely unknown message: no invented reply, fail-safe transfers to a human (Fase 6)", async () => {
+  it("K. completely unknown message: no invented reply, silent per-message handoff (Fase 7)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -659,13 +588,14 @@ describe("multi-intent resolution + GPT classifier fallback (Fase 5)", () => {
 
     // Even with requires_human explicitly false, zero resolvable intents is
     // itself the fail-safe trigger (rule 7): never invent an answer, always
-    // hand off to Jhoselin. Fase 6.1: silently — no transfer message sent.
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    // hand off to Jhoselin — silently, for this message only (Fase 7: no
+    // pause, flow state stays WAITING_FOR_SPORT, not a terminal node).
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
     expect(adapter.sendText.mock.calls.length).toBe(1); // only the "Hola" greeting from message 1
-    expect(repository.automationStatus).toBe("paused_human");
+    expect(repository.automationStatus).toBe("active");
   });
 
-  it("L. RUN-08 code + FAQ in the same message: FAQ still answers, selection is a silent handoff (Fase 6.2)", async () => {
+  it("L. RUN-08 code + FAQ in the same message: FAQ still answers, selection is a silent per-message handoff (Fase 7)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     gateway.faqs = [entregaFaq];
@@ -678,36 +608,28 @@ describe("multi-intent resolution + GPT classifier fallback (Fase 5)", () => {
     const replies = adapter.sendText.mock.calls.slice(2).map((call) => call[1] as string);
     expect(replies).toEqual([entregaFaq.answer]); // FAQ answered, no selection-confirmation message
     const execution = gateway.executionFor("conversation-1");
-    expect(execution?.state).toBe("HUMAN_HANDOFF");
+    expect(execution?.state).toBe("WAITING_FOR_SELECTION"); // stays live, not a terminal node
     expect(execution?.variables.selectedCode).toBe("RUN-08");
   });
 
-  it("M. paused_human (unexpired HUMAN_HANDOFF): zero replies, zero GPT calls", async () => {
+  it("M. after a selection handoff, the very next message is still evaluated normally (Fase 7: no pause)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [entregaFaq];
     const adapter = adapterMock();
-    const { ai, calls } = makeAi(() => JSON.stringify({ intents: [{ type: "sport", id: "running", confidence: 0.9 }] }));
 
-    await processWhatsAppWebhook(payload("wamid.1", "Hola", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: ai });
-    await processWhatsAppWebhook(payload("wamid.2", "running", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway, intakeAi: ai });
-    await processWhatsAppWebhook(payload("wamid.3", "Hola, me interesa el diseño RUN-08", BASE_UNIX_SECONDS + 120), {
-      repository,
-      adapter,
-      intakeGateway: gateway,
-      intakeAi: ai
-    });
-    expect(repository.automationStatus).toBe("paused_human");
+    await processWhatsAppWebhook(payload("wamid.1", "Hola", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+    await processWhatsAppWebhook(payload("wamid.2", "running", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
+    await processWhatsAppWebhook(payload("wamid.3", "Hola, me interesa el diseño RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+    expect(repository.automationStatus).toBe("active"); // never paused
 
     const callsBefore = adapter.sendText.mock.calls.length;
-    await processWhatsAppWebhook(payload("wamid.4", "quiero uno para mis carreras", BASE_UNIX_SECONDS + 180), {
-      repository,
-      adapter,
-      intakeGateway: gateway,
-      intakeAi: ai
-    });
+    // A resolvable FAQ right after a selection handoff must answer
+    // normally — the bot is never blocked by the previous turn's handoff.
+    await processWhatsAppWebhook(payload("wamid.4", "cuánto tardan?", BASE_UNIX_SECONDS + 180), { repository, adapter, intakeGateway: gateway });
 
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
-    expect(calls()).toBe(0);
+    expect(adapter.sendText.mock.calls.length).toBe(callsBefore + 1);
+    expect(adapter.sendText.mock.calls[callsBefore]?.[1]).toBe(entregaFaq.answer);
   });
 
   it("N. automation globally INACTIVA: zero replies, zero GPT calls", async () => {
@@ -756,7 +678,7 @@ describe("multi-intent resolution + GPT classifier fallback (Fase 5)", () => {
     expect(calls()).toBe(0);
   });
 
-  it("without OPENAI_API_KEY configured (no intakeAi dependency), no classifier runs, still fails safe to a human handoff (Fase 6)", async () => {
+  it("without OPENAI_API_KEY configured (no intakeAi dependency), no classifier runs, still fails safe to a silent handoff (Fase 7)", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -766,35 +688,53 @@ describe("multi-intent resolution + GPT classifier fallback (Fase 5)", () => {
 
     // Zero resolvable intents (with or without a working classifier) is
     // itself the fail-safe trigger: never loop the customer on a canned
-    // retry message forever, always hand off — silently (Fase 6.1).
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    // retry message forever, always hand off — silently, for this message
+    // only (Fase 7: no pause, state stays WAITING_FOR_SPORT).
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
     expect(adapter.sendText.mock.calls.length).toBe(1); // only the "Hola" greeting from message 1
+    expect(repository.automationStatus).toBe("active");
   });
 });
 
-describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
+describe("Fase 7: per-message handoff (no conversation pause)", () => {
   const pagoFaq = {
-    id: "faq-pago-f6",
+    id: "faq-pago-f7",
     title: "Forma de pago",
     answer: "Aceptamos QR, transferencia y efectivo.",
-    aliases: ["como puedo pagar"],
+    aliases: ["como puedo pagar", "cuánto hay que dar de anticipo"],
     sortOrder: 0,
     active: true
   };
   const entregaFaq = {
-    id: "faq-entrega-f6",
+    id: "faq-entrega-f7",
     title: "Tiempo de entrega",
     answer: "Entregas miércoles y sábados.",
-    aliases: ["cuanto tardan"],
+    aliases: ["cuanto tardan", "cuánto demora"],
     sortOrder: 1,
     active: true
   };
   const ubicacionFaq = {
-    id: "faq-ubicacion-f6",
+    id: "faq-ubicacion-f7",
     title: "Ubicación",
     answer: "Estamos en Santa Cruz de la Sierra.",
-    aliases: ["son de santa cruz"],
+    aliases: ["son de santa cruz", "de dónde son"],
     sortOrder: 2,
+    active: true
+  };
+  const materialFaq = {
+    id: "faq-material-f7",
+    title: "Material",
+    answer: "Madera trupan con detalles en acrílico.",
+    aliases: ["de que material es"],
+    sortOrder: 3,
+    active: true
+  };
+  const enviosFaq = {
+    id: "faq-envios-f7",
+    title: "Envíos nacionales",
+    answer: "Sí, hacemos envíos a todo Bolivia.",
+    aliases: ["hacen envios a cochabamba", "hacen envios a oruro"],
+    sortOrder: 4,
     active: true
   };
 
@@ -816,63 +756,100 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
    * the RUNNER's own handoff logic, so a fixed fake response is enough. */
   const { ai: requiresHumanAi } = makeAi(() => JSON.stringify({ intents: [], requires_human: true }));
 
-  it("A. 'ya hice el pago': HUMAN_HANDOFF, zero bot replies (silent handoff, Fase 6.1)", async () => {
+  it("A. 'ya hice el pago': silent handoff (0 bot replies), then the NEXT message's FAQ answers normally", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [enviosFaq];
     const adapter = adapterMock();
 
     await processWhatsAppWebhook(payload("wamid.1", "ya hice el pago", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-
     expect(adapter.sendText).not.toHaveBeenCalled();
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-    expect(repository.automationStatus).toBe("paused_human");
+    expect(repository.automationStatus).toBe("active"); // never paused
+
+    await processWhatsAppWebhook(payload("wamid.2", "hacen envios a cochabamba?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText.mock.calls).toHaveLength(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe(enviosFaq.answer);
   });
 
-  it("B. 'dónde está mi pedido?': HUMAN_HANDOFF, zero bot replies", async () => {
+  it("B. 'ya hice el pago' then 'cuánto demora?': FAQ tiempo answers on the next message", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [entregaFaq];
     const adapter = adapterMock();
 
-    await processWhatsAppWebhook(payload("wamid.1", "dónde está mi pedido?", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
+    await processWhatsAppWebhook(payload("wamid.1", "ya hice el pago", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
+    await processWhatsAppWebhook(payload("wamid.2", "cuánto demora?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
 
-    expect(adapter.sendText).not.toHaveBeenCalled();
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    expect(adapter.sendText.mock.calls).toHaveLength(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe(entregaFaq.answer);
   });
 
-  it("C. 'quiero hablar con alguien': HUMAN_HANDOFF, zero bot replies", async () => {
+  it("C. 'quiero un diseño personalizado' then 'de que material es?': FAQ material answers on the next message", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-
-    await processWhatsAppWebhook(payload("wamid.1", "quiero hablar con alguien", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-
-    expect(adapter.sendText).not.toHaveBeenCalled();
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-  });
-
-  it("D. 'tengo un problema con mi pedido': HUMAN_HANDOFF, zero bot replies", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-
-    await processWhatsAppWebhook(payload("wamid.1", "tengo un problema con mi pedido", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-
-    expect(adapter.sendText).not.toHaveBeenCalled();
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-  });
-
-  it("E. 'quiero un diseño personalizado': HUMAN_HANDOFF, zero bot replies", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [materialFaq];
     const adapter = adapterMock();
 
     await processWhatsAppWebhook(payload("wamid.1", "quiero un diseño personalizado", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
+    await processWhatsAppWebhook(payload("wamid.2", "de que material es?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
 
-    expect(adapter.sendText).not.toHaveBeenCalled();
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    expect(adapter.sendText.mock.calls).toHaveLength(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe(materialFaq.answer);
   });
 
-  it("F. SPORT + personalization: the sport reply is allowed, then silent HUMAN_HANDOFF — zero transfer message", async () => {
+  it("D. 'tengo un problema con mi pedido' then 'cuánto hay que dar de anticipo?': FAQ pago answers on the next message", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [pagoFaq];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "tengo un problema con mi pedido", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
+    await processWhatsAppWebhook(payload("wamid.2", "cuánto hay que dar de anticipo?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText.mock.calls).toHaveLength(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe(pagoFaq.answer);
+  });
+
+  it("E. 'quiero hablar con alguien' then 'de dónde son?': FAQ ubicación answers on the next message", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [ubicacionFaq];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "quiero hablar con alguien", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
+    await processWhatsAppWebhook(payload("wamid.2", "de dónde son?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText.mock.calls).toHaveLength(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe(ubicacionFaq.answer);
+  });
+
+  it("F. full coexistence sequence: sport -> FAQ -> silent RUN-08 handoff -> FAQ, all in one conversation", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [enviosFaq, entregaFaq];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "quiero running", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SELECTION");
+    expect(adapter.sendText.mock.calls[0]?.[1]).toContain("/catalogo/running");
+
+    await processWhatsAppWebhook(payload("wamid.2", "hacen envios a oruro?", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
+    expect(adapter.sendText.mock.calls[1]?.[1]).toBe(enviosFaq.answer);
+
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+    expect(adapter.sendText.mock.calls).toHaveLength(2); // silent: no new reply for the selection
+    const midExecution = gateway.executionFor("conversation-1");
+    expect(midExecution?.state).toBe("WAITING_FOR_SELECTION"); // stays live
+    expect(midExecution?.variables.selectedCode).toBe("RUN-08");
+    expect(repository.automationStatus).toBe("active"); // never paused
+
+    await processWhatsAppWebhook(payload("wamid.4", "cuánto demora?", BASE_UNIX_SECONDS + 180), { repository, adapter, intakeGateway: gateway });
+    expect(adapter.sendText.mock.calls).toHaveLength(3);
+    expect(adapter.sendText.mock.calls[2]?.[1]).toBe(entregaFaq.answer);
+  });
+
+  it("SPORT + personalization: the sport reply is allowed, silent handoff for the human part, conversation stays live", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -888,11 +865,11 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
     const replies = adapter.sendText.mock.calls.map((call) => call[1] as string);
     expect(replies).toHaveLength(1); // only the sport/catalog reply, no transfer message appended
     expect(replies[0]).toContain("/catalogo/running");
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SELECTION"); // not a terminal node
     expect(gateway.executionFor("conversation-1")?.variables.sportSlug).toBe("running");
   });
 
-  it("G. FAQ + requires_human: the FAQ reply is allowed, then silent HUMAN_HANDOFF — zero additional message", async () => {
+  it("FAQ + requires_human: the FAQ reply is allowed, silent handoff for the human part, state unchanged", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     gateway.faqs = [pagoFaq];
@@ -908,10 +885,10 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
 
     const replies = adapter.sendText.mock.calls.map((call) => call[1] as string);
     expect(replies).toEqual([pagoFaq.answer]); // FAQ answered, nothing appended after it
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
   });
 
-  it("H. RUN-XX: fully silent handoff (Fase 6.2) — no selection-confirmation, no transfer message", async () => {
+  it("RUN-XX: fully silent handoff — no selection-confirmation, no transfer message, conversation stays live", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -923,43 +900,12 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
 
     expect(adapter.sendText.mock.calls.length).toBe(callsBefore); // zero new replies
     const execution = gateway.executionFor("conversation-1");
-    expect(execution?.state).toBe("HUMAN_HANDOFF");
+    expect(execution?.state).toBe("WAITING_FOR_SELECTION");
     expect(execution?.variables.selectedCode).toBe("RUN-08");
-  });
-
-  it("I. paused_human: zero bot replies, zero GPT calls", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    const { ai, calls } = makeAi(() => JSON.stringify({ intents: [], requires_human: true }));
-
-    await processWhatsAppWebhook(payload("wamid.1", "ya hice el pago", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: ai });
-    expect(repository.automationStatus).toBe("paused_human");
-
-    const callsBefore = adapter.sendText.mock.calls.length;
-    await processWhatsAppWebhook(payload("wamid.2", "hola, siguen ahi?", BASE_UNIX_SECONDS + 3600), { repository, adapter, intakeGateway: gateway, intakeAi: ai });
-
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
-    expect(calls()).toBe(1); // only the original handoff-triggering call, none for the follow-up
-  });
-
-  it("J. >=48h inactivity: next inbound starts a fresh, normal session", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-
-    await processWhatsAppWebhook(payload("wamid.1", "ya hice el pago", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-    expect(adapter.sendText).not.toHaveBeenCalled(); // silent handoff
-
-    await processWhatsAppWebhook(payload("wamid.2", "hola", BASE_UNIX_SECONDS + 48 * 3600), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-
     expect(repository.automationStatus).toBe("active");
-    expect(gateway.resumedConversations).toContain("conversation-1");
-    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
-    expect(adapter.sendText.mock.calls[0]?.[1]).toBe(DEFAULT_INTAKE_MESSAGES.greeting);
   });
 
-  it("K. plain greeting on NEW: normal behavior, no handoff", async () => {
+  it("plain greeting on NEW: normal behavior, no handoff, no GPT call", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -972,7 +918,7 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
     expect(calls()).toBe(0); // greeting never reaches GPT
   });
 
-  it("L. a resolvable FAQ answers normally, never triggers a handoff", async () => {
+  it("a resolvable FAQ answers normally, never triggers a handoff", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     gateway.faqs = [pagoFaq];
@@ -1008,7 +954,7 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
     expect(gateway.executionFor("conversation-1")?.variables.sportSlug).toBe("running");
   });
 
-  it("WAITING_FOR_SELECTION + unresolved message: silent HUMAN_HANDOFF", async () => {
+  it("WAITING_FOR_SELECTION + unresolved message: silent handoff, sport context preserved", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -1024,37 +970,9 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
       intakeAi: ai
     });
 
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
-    expect(adapter.sendText.mock.calls.length).toBe(callsBefore); // no new reply at all
-  });
-
-  it("an inbound message during paused_human still counts as activity (extends the 48h window per existing logic)", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-
-    await processWhatsAppWebhook(payload("wamid.1", "ya hice el pago", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-    // +10h: within the window, but this message IS the new "last activity".
-    await processWhatsAppWebhook(payload("wamid.2", "hola", BASE_UNIX_SECONDS + 10 * 3600), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-
-    // +50h from the original handoff, but only +40h from wamid.2 -> must still stay silent.
-    await processWhatsAppWebhook(payload("wamid.3", "hola", BASE_UNIX_SECONDS + 50 * 3600), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-
-    expect(adapter.sendText).not.toHaveBeenCalled(); // silent throughout
-    expect(repository.automationStatus).toBe("paused_human");
-  });
-
-  it(">=48h inactivity + 'quiero running': fresh session resolves the sport directly", async () => {
-    const repository = new MemoryRepository();
-    const gateway = new FakeIntakeGateway(repository);
-    const adapter = adapterMock();
-    const { ai: notRequiredAi } = makeAi(() => JSON.stringify({ intents: [], requires_human: false }));
-
-    await processWhatsAppWebhook(payload("wamid.1", "ya hice el pago", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: requiresHumanAi });
-    await processWhatsAppWebhook(payload("wamid.2", "quiero running", BASE_UNIX_SECONDS + 48 * 3600), { repository, adapter, intakeGateway: gateway, intakeAi: notRequiredAi });
-
-    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SELECTION");
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SELECTION"); // sport context preserved
     expect(gateway.executionFor("conversation-1")?.variables.sportSlug).toBe("running");
+    expect(adapter.sendText.mock.calls.length).toBe(callsBefore); // no new reply at all
   });
 
   it("automation globally INACTIVA: zero replies, zero GPT calls, never a handoff", async () => {
@@ -1071,7 +989,7 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
     expect(calls()).toBe(0);
   });
 
-  it("OpenAI timeout/error on an otherwise-unresolved message: fails safe to a silent HUMAN_HANDOFF, never throws", async () => {
+  it("OpenAI timeout/error on an otherwise-unresolved message: fails safe to a silent handoff, never throws", async () => {
     const repository = new MemoryRepository();
     const gateway = new FakeIntakeGateway(repository);
     const adapter = adapterMock();
@@ -1081,7 +999,7 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
       processWhatsAppWebhook(payload("wamid.1", "quiero hablar con alguien", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway, intakeAi: ai })
     ).resolves.toBeUndefined();
 
-    expect(gateway.executionFor("conversation-1")?.state).toBe("HUMAN_HANDOFF");
+    expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SPORT");
     expect(adapter.sendText).not.toHaveBeenCalled();
   });
 
@@ -1102,5 +1020,257 @@ describe("UNKNOWN -> HUMAN_HANDOFF (Fase 6)", () => {
     // extra content must never override that with a forced handoff.
     expect(gateway.executionFor("conversation-1")?.state).toBe("WAITING_FOR_SELECTION");
     expect(gateway.executionFor("conversation-1")?.variables.sportSlug).toBe("running");
+  });
+});
+
+describe("Fase 8: Media V1 (catalog images + FAQ media)", () => {
+  async function reachSelection(repository: MemoryRepository, gateway: FakeIntakeGateway, adapter: ReturnType<typeof adapterMock>) {
+    await processWhatsAppWebhook(payload("wamid.1", "Hola", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+    await processWhatsAppWebhook(payload("wamid.2", "running", BASE_UNIX_SECONDS + 60), { repository, adapter, intakeGateway: gateway });
+  }
+
+  it("Q1. 'RUN-08': sends the real RUN-08 image, handoff:true, zero text replies", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    const textCallsBefore = adapter.sendText.mock.calls.length;
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText.mock.calls.length).toBe(textCallsBefore); // no text at all
+    expect(adapter.sendImage).toHaveBeenCalledTimes(1);
+    expect(adapter.sendImage.mock.calls[0]?.[1]).toBe(gateway.imageUrlByCode.get("RUN-08"));
+    const execution = gateway.executionFor("conversation-1");
+    expect(execution?.variables.selectedCode).toBe("RUN-08");
+    expect(execution?.variables.selectedCodes).toEqual(["RUN-08"]);
+  });
+
+  it("Q2. 'Me interesa este diseño: RUN-08': recognizes the code inside the new prefill phrasing", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    await processWhatsAppWebhook(payload("wamid.3", "Me interesa este diseño: RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendImage).toHaveBeenCalledTimes(1);
+    expect(adapter.sendImage.mock.calls[0]?.[1]).toBe(gateway.imageUrlByCode.get("RUN-08"));
+  });
+
+  it("Q3. 'RUN-08 y RUN-14': two images, in that order", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08 y RUN-14", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendImage).toHaveBeenCalledTimes(2);
+    expect(adapter.sendImage.mock.calls[0]?.[1]).toBe(gateway.imageUrlByCode.get("RUN-08"));
+    expect(adapter.sendImage.mock.calls[1]?.[1]).toBe(gateway.imageUrlByCode.get("RUN-14"));
+    expect(gateway.executionFor("conversation-1")?.variables.selectedCodes).toEqual(["RUN-08", "RUN-14"]);
+  });
+
+  it("Q4. 'RUN-08, RUN-14 y RUN-21': three images", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08, RUN-14 y RUN-21", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendImage).toHaveBeenCalledTimes(3);
+    expect(gateway.executionFor("conversation-1")?.variables.selectedCodes).toEqual(["RUN-08", "RUN-14", "RUN-21"]);
+  });
+
+  it("Q5. 'RUN-08 RUN-08 RUN-14': deduplicates, 2 images", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08 RUN-08 RUN-14", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendImage).toHaveBeenCalledTimes(2);
+    expect(gateway.executionFor("conversation-1")?.variables.selectedCodes).toEqual(["RUN-08", "RUN-14"]);
+  });
+
+  it("Q6. 'RUN-99' (nonexistent code): never invents an image, silent handoff like any unresolved message", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    const { ai } = (() => {
+      const client: ClassifierCompletionClient = { complete: async () => JSON.stringify({ intents: [], requires_human: false }) };
+      return { ai: { config: { apiKey: "k", model: "m", minConfidence: 0.8, timeoutMs: 1000 }, client } };
+    })();
+    await reachSelection(repository, gateway, adapter);
+
+    const callsBefore = adapter.sendText.mock.calls.length;
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-99", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway, intakeAi: ai });
+
+    expect(adapter.sendImage).not.toHaveBeenCalled();
+    expect(adapter.sendText.mock.calls.length).toBe(callsBefore);
+    expect(gateway.executionFor("conversation-1")?.variables.selectedCode).toBeUndefined();
+  });
+
+  it("Q7. after a RUN-08 image, a later FAQ answers normally (Fase 7 intact)", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [{ id: "faq-envios-media", title: "Envíos", answer: "Sí, hacemos envíos.", aliases: ["hacen envios"], sortOrder: 0, active: true }];
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    const textCallsBefore = adapter.sendText.mock.calls.length;
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+    expect(adapter.sendImage).toHaveBeenCalledTimes(1);
+
+    await processWhatsAppWebhook(payload("wamid.4", "hacen envios?", BASE_UNIX_SECONDS + 180), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText.mock.calls.length).toBe(textCallsBefore + 1);
+    expect(adapter.sendText.mock.calls[textCallsBefore]?.[1]).toBe("Sí, hacemos envíos.");
+  });
+
+  it("D. selections across separate messages (RUN-08, then RUN-14, then RUN-21) each send their own image", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    const adapter = adapterMock();
+    await reachSelection(repository, gateway, adapter);
+
+    await processWhatsAppWebhook(payload("wamid.3", "RUN-08", BASE_UNIX_SECONDS + 120), { repository, adapter, intakeGateway: gateway });
+    await processWhatsAppWebhook(payload("wamid.4", "RUN-14", BASE_UNIX_SECONDS + 180), { repository, adapter, intakeGateway: gateway });
+    await processWhatsAppWebhook(payload("wamid.5", "RUN-21", BASE_UNIX_SECONDS + 240), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendImage).toHaveBeenCalledTimes(3);
+    expect(adapter.sendImage.mock.calls.map((call) => call[1])).toEqual([
+      gateway.imageUrlByCode.get("RUN-08"),
+      gateway.imageUrlByCode.get("RUN-14"),
+      gateway.imageUrlByCode.get("RUN-21")
+    ]);
+  });
+
+  // --- R. FAQ media fixtures ---
+
+  it("R1. FAQ text only: a single text reply", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [{ id: "faq-r1", title: "Material", answer: "Madera trupan.", aliases: ["de que material es"], sortOrder: 0, active: true }];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "de que material es?", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText).toHaveBeenCalledTimes(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe("Madera trupan.");
+    expect(adapter.sendImage).not.toHaveBeenCalled();
+  });
+
+  it("R2. FAQ text + 1 image: text then the image", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [
+      {
+        id: "faq-r2",
+        title: "Recojo",
+        answer: "Estamos en Av. Paragua, 3er anillo interno.",
+        aliases: ["puedo pasar a recoger"],
+        sortOrder: 0,
+        active: true,
+        media: [{ url: "https://example.test/automation-media/casa.jpg", sortOrder: 0 }]
+      }
+    ];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "puedo pasar a recoger?", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText).toHaveBeenCalledTimes(1);
+    expect(adapter.sendText.mock.calls[0]?.[1]).toBe("Estamos en Av. Paragua, 3er anillo interno.");
+    expect(adapter.sendImage).toHaveBeenCalledTimes(1);
+    expect(adapter.sendImage.mock.calls[0]?.[1]).toBe("https://example.test/automation-media/casa.jpg");
+  });
+
+  it("R3. FAQ text + 2 images: text then both images in sort_order", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [
+      {
+        id: "faq-r3",
+        title: "QR",
+        answer: "Puedes pagar escaneando el QR.",
+        aliases: ["tienen qr"],
+        sortOrder: 0,
+        active: true,
+        media: [
+          { url: "https://example.test/automation-media/qr-2.jpg", sortOrder: 1 },
+          { url: "https://example.test/automation-media/qr-1.jpg", sortOrder: 0 }
+        ]
+      }
+    ];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "tienen qr?", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText).toHaveBeenCalledTimes(1);
+    expect(adapter.sendImage).toHaveBeenCalledTimes(2);
+    // sort_order respected regardless of array insertion order (R8 reorder coverage)
+    expect(adapter.sendImage.mock.calls[0]?.[1]).toBe("https://example.test/automation-media/qr-1.jpg");
+    expect(adapter.sendImage.mock.calls[1]?.[1]).toBe("https://example.test/automation-media/qr-2.jpg");
+  });
+
+  it("R4. FAQ image only (no text): a single image reply, no empty text message", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [
+      {
+        id: "faq-r4",
+        title: "Foto local",
+        answer: "",
+        aliases: ["como es el local"],
+        sortOrder: 0,
+        active: true,
+        media: [{ url: "https://example.test/automation-media/local.jpg", sortOrder: 0 }]
+      }
+    ];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "como es el local?", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText).not.toHaveBeenCalled();
+    expect(adapter.sendImage).toHaveBeenCalledTimes(1);
+  });
+
+  it("R5. FAQ with no text and no media: never sends an empty reply", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    // Not realistically creatable via the admin UI (answer is required), but
+    // the runner must stay safe even if a row ends up empty by accident.
+    gateway.faqs = [{ id: "faq-r5", title: "Vacía", answer: "", aliases: ["frase-vacia-r5"], sortOrder: 0, active: true }];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "frase-vacia-r5", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText).not.toHaveBeenCalled();
+    expect(adapter.sendImage).not.toHaveBeenCalled();
+  });
+
+  it("R6. an inactive FAQ with media never responds", async () => {
+    const repository = new MemoryRepository();
+    const gateway = new FakeIntakeGateway(repository);
+    gateway.faqs = [
+      {
+        id: "faq-r6",
+        title: "Inactiva",
+        answer: "No debería verse.",
+        aliases: ["frase-inactiva-r6"],
+        sortOrder: 0,
+        active: false,
+        media: [{ url: "https://example.test/automation-media/no.jpg", sortOrder: 0 }]
+      }
+    ];
+    const adapter = adapterMock();
+
+    await processWhatsAppWebhook(payload("wamid.1", "frase-inactiva-r6", BASE_UNIX_SECONDS), { repository, adapter, intakeGateway: gateway });
+
+    expect(adapter.sendText).not.toHaveBeenCalled();
+    expect(adapter.sendImage).not.toHaveBeenCalled();
   });
 });

@@ -28,6 +28,10 @@ export interface IntakeVariables {
   sportSlug?: string;
   sportName?: string;
   selectedCode?: string;
+  /** Fase 8: every code selected across one or more messages (not just the
+   * most recent one) — additive alongside `selectedCode`, which is kept for
+   * backward compatibility and always mirrors the FIRST entry here. */
+  selectedCodes?: string[];
   /** Set by the integration layer once a selection is persisted, never by step() itself. */
   imageId?: string;
 }
@@ -113,10 +117,31 @@ export function resolveSport(input: string, sports: CatalogSport[]): CatalogSpor
 
 const CODE_PATTERN = /[A-Za-z]{2,4}-\d{1,4}/;
 
+/**
+ * Every valid, distinct code mentioned in `input`, in the order they first
+ * appear (e.g. "RUN-08, RUN-14 y RUN-21" -> ["RUN-08","RUN-14","RUN-21"];
+ * "RUN-08 RUN-08 RUN-14" -> ["RUN-08","RUN-14"]). A code not present in
+ * `validCodes` is silently ignored rather than invented (Fase 8: "RUN-99"
+ * never produces an image). No fuzzy matching — "RUN-8" is never treated as
+ * "RUN-08" unless it is itself a valid code.
+ */
+export function resolveCodes(input: string, validCodes: string[]): string[] {
+  const matches = input.toUpperCase().matchAll(new RegExp(CODE_PATTERN, "g"));
+  const seen = new Set<string>();
+  const codes: string[] = [];
+  for (const match of matches) {
+    const code = match[0];
+    if (!validCodes.includes(code) || seen.has(code)) continue;
+    seen.add(code);
+    codes.push(code);
+  }
+  return codes;
+}
+
+/** Single-best-match convenience wrapper over resolveCodes(), kept for
+ * callers (e.g. step() below) that only ever want the first code. */
 export function resolveCode(input: string, validCodes: string[]): string | null {
-  const match = input.toUpperCase().match(CODE_PATTERN);
-  if (!match) return null;
-  return validCodes.includes(match[0]) ? match[0] : null;
+  return resolveCodes(input, validCodes)[0] ?? null;
 }
 
 function render(template: string, vars: Record<string, string>): string {

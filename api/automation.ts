@@ -102,6 +102,21 @@ async function getFaqsWithAliases(db: Db, companyId: string, flowId: string) {
     aliasesByFaq.set(row.faq_id, list);
   }
 
+  // Fase 8: FAQ image attachments — the bucket is public (Meta must be able
+  // to fetch it directly at send time), so the admin listing uses the same
+  // plain public URL rather than a signed one.
+  const { data: mediaRows, error: mediaError } = faqIds.length
+    ? await db.from("automation_faq_media").select("id,faq_id,storage_path,sort_order").in("faq_id", faqIds).order("sort_order")
+    : { data: [], error: null };
+  if (mediaError) throw mediaError;
+  const mediaByFaq = new Map<string, { id: string; url: string; sortOrder: number }[]>();
+  for (const row of mediaRows ?? []) {
+    const { data } = db.storage.from("automation-media").getPublicUrl(row.storage_path);
+    const list = mediaByFaq.get(row.faq_id) ?? [];
+    list.push({ id: row.id, url: data.publicUrl, sortOrder: row.sort_order });
+    mediaByFaq.set(row.faq_id, list);
+  }
+
   return (faqs ?? []).map((faq) => ({
     id: faq.id,
     title: faq.title,
@@ -109,7 +124,8 @@ async function getFaqsWithAliases(db: Db, companyId: string, flowId: string) {
     classifierDescription: faq.classifier_description,
     active: faq.active,
     sortOrder: faq.sort_order,
-    aliases: aliasesByFaq.get(faq.id) ?? []
+    aliases: aliasesByFaq.get(faq.id) ?? [],
+    media: mediaByFaq.get(faq.id) ?? []
   }));
 }
 

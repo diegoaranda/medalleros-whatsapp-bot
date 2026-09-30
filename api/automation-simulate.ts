@@ -60,7 +60,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const categoryIds = (categories ?? []).map((category) => category.id);
     const [{ data: media, error: mediaError }, { data: aliasRows, error: aliasError }] = categoryIds.length
       ? await Promise.all([
-          db.from("catalog_category_media").select("category_id,code").in("category_id", categoryIds).order("sort_order"),
+          db.from("catalog_category_media").select("category_id,code,storage_path").in("category_id", categoryIds).order("sort_order"),
           db.from("catalog_category_aliases").select("category_id,alias").in("category_id", categoryIds)
         ])
       : [{ data: [], error: null }, { data: [], error: null }];
@@ -68,10 +68,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (aliasError) throw aliasError;
 
     const codesByCategory = new Map<string, string[]>();
+    // Fase 8: reuse the catalog's own public image for the simulator preview
+    // — never re-uploaded or copied elsewhere.
+    const imageUrlByCode = new Map<string, string>();
     for (const entry of media ?? []) {
       const list = codesByCategory.get(entry.category_id) ?? [];
       list.push(entry.code);
       codesByCategory.set(entry.category_id, list);
+      const { data } = db.storage.from("catalog-media").getPublicUrl(entry.storage_path);
+      imageUrlByCode.set(entry.code, data.publicUrl);
     }
     const aliasesByCategory = new Map<string, string[]>();
     for (const entry of aliasRows ?? []) {
@@ -90,7 +95,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     // FAQs are transversal: checked before the normal step whenever the bot
     // still controls the conversation, and never while handed off.
-    let faqs: { id: string; title: string; answer: string; classifierDescription: string | null; sortOrder: number; aliases: string[] }[] = [];
+    let faqs: { id: string; title: string; answer: string; classifierDescription: string | null; sortOrder: number; aliases: string[]; media: { url: string; sortOrder: number }[] }[] = [];
     if (state !== "HUMAN_HANDOFF" && flow) {
       const { data: faqRows, error: faqError } = await db
         .from("automation_faqs")
@@ -101,15 +106,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         .order("sort_order");
       if (faqError) throw faqError;
       const faqIds = (faqRows ?? []).map((faq) => faq.id);
-      const { data: faqAliasRows, error: faqAliasError } = faqIds.length
-        ? await db.from("automation_faq_aliases").select("faq_id,alias").in("faq_id", faqIds)
-        : { data: [], error: null };
+      const [{ data: faqAliasRows, error: faqAliasError }, { data: faqMediaRows, error: faqMediaError }] = faqIds.length
+        ? await Promise.all([
+            db.from("automation_faq_aliases").select("faq_id,alias").in("faq_id", faqIds),
+            db.from("automation_faq_media").select("faq_id,storage_path,sort_order").in("faq_id", faqIds).order("sort_order")
+          ])
+        : [{ data: [], error: null }, { data: [], error: null }];
       if (faqAliasError) throw faqAliasError;
+      if (faqMediaError) throw faqMediaError;
       const faqAliasesByFaq = new Map<string, string[]>();
       for (const row of faqAliasRows ?? []) {
         const list = faqAliasesByFaq.get(row.faq_id) ?? [];
         list.push(row.alias);
         faqAliasesByFaq.set(row.faq_id, list);
+      }
+      const faqMediaByFaq = new Map<string, { url: string; sortOrder: number }[]>();
+      for (const row of faqMediaRows ?? []) {
+        const { data } = db.storage.from("automation-media").getPublicUrl(row.storage_path);
+        const list = faqMediaByFaq.get(row.faq_id) ?? [];
+        list.push({ url: data.publicUrl, sortOrder: row.sort_order });
+        faqMediaByFaq.set(row.faq_id, list);
       }
       faqs = (faqRows ?? []).map((faq) => ({
         id: faq.id,
@@ -117,7 +133,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         answer: faq.answer,
         classifierDescription: faq.classifier_description,
         sortOrder: faq.sort_order,
-        aliases: faqAliasesByFaq.get(faq.id) ?? []
+        aliases: faqAliasesByFaq.get(faq.id) ?? [],
+        media: faqMediaByFaq.get(faq.id) ?? []
       }));
     }
 
@@ -126,14 +143,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // OPENAI_API_KEY): see resolveIntakeTurn in src/flows/intake-runner.ts.
     // This is a dev-only preview endpoint — no message/execution is ever
     // persisted here, so it is safe to call even while automation is INACTIVA.
+    // Media replies (Fase 8) are returned as structured items too — never
+    // sent over real WhatsApp from this endpoint.
     const aiConfig = loadIntentClassifierConfigFromEnv();
     const ai = aiConfig ? { config: aiConfig, client: new OpenAiCompletionClient() } : undefined;
-    const outcome = await resolveIntakeTurn({ state, variables, input, messages, sports, faqs, ai });
+    const outcome = await resolveIntakeTurn({ state, variables, input, messages, sports, faqs, imageUrlByCode, ai });
     return res.status(200).json({
       state: outcome.state,
       variables: outcome.variables,
       replies: outcome.replies,
       resolvedIntents: outcome.resolvedIntents,
+      handoff: outcome.handoff,
       aiCalled: outcome.aiCalled,
       aiLatencyMs: outcome.aiLatencyMs,
       aiModel: outcome.aiModel

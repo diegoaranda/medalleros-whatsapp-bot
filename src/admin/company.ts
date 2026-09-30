@@ -5,7 +5,7 @@ export async function getAdminCompany() {
   if (!companyId) throw new Error("ADMIN_COMPANY_ID is required for the administrative UI");
   const { data, error } = await getSupabaseAdmin()
     .from("companies")
-    .select("id,name")
+    .select("id,name,catalog_prefill_template")
     .eq("id", companyId)
     .maybeSingle();
   if (error || !data) throw new Error("La empresa administrativa no está disponible");

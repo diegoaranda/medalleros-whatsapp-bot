@@ -1,4 +1,4 @@
-import type { NormalizedInboundMessage } from "../core/types.js";
+import type { NormalizedInboundMessage, NormalizedMessageEcho } from "../core/types.js";
 
 type UnknownRecord = Record<string, unknown>;
 
@@ -54,6 +54,50 @@ export function normalizeWhatsAppMessages(payload: unknown): NormalizedInboundMe
           text: type === "text" ? stringValue(content.body) : undefined,
           senderName: profile ? stringValue(profile.name) : undefined,
           content
+        });
+      }
+    }
+  }
+
+  return normalized;
+}
+
+/** Business app echoes are outbound events, never customer input to a flow. */
+export function normalizeWhatsAppMessageEchoes(payload: unknown): NormalizedMessageEcho[] {
+  if (!isRecord(payload) || !Array.isArray(payload.entry)) return [];
+  const normalized: NormalizedMessageEcho[] = [];
+
+  for (const entry of payload.entry) {
+    if (!isRecord(entry) || !Array.isArray(entry.changes)) continue;
+    for (const change of entry.changes) {
+      if (!isRecord(change) || change.field !== "smb_message_echoes" || !isRecord(change.value)) continue;
+      const value = change.value;
+      const metadata = isRecord(value.metadata) ? value.metadata : undefined;
+      const channelExternalId = metadata ? stringValue(metadata.phone_number_id) : undefined;
+      if (!channelExternalId || !Array.isArray(value.message_echoes)) continue;
+
+      for (const candidate of value.message_echoes) {
+        if (!isRecord(candidate)) continue;
+        const recipient = stringValue(candidate.to);
+        const id = stringValue(candidate.id);
+        const type = stringValue(candidate.type);
+        const timestamp = candidate.timestamp;
+        if (!recipient || !id || !type ||
+          !((typeof timestamp === "string" && /^\d+$/.test(timestamp)) ||
+            (typeof timestamp === "number" && Number.isInteger(timestamp) && timestamp >= 0))) continue;
+        const date = new Date(Number(timestamp) * 1000);
+        if (!Number.isFinite(date.getTime())) continue;
+
+        normalized.push({
+          provider: "whatsapp",
+          channelExternalId,
+          // Echoes may include '+', whereas inbound `from` uses country-code digits.
+          recipientExternalId: recipient.replace(/^\+(?=\d+$)/, ""),
+          externalMessageId: id,
+          timestamp: date.toISOString(),
+          type,
+          text: type === "text" ? stringValue(messageContent(candidate).body) : undefined,
+          content: { ...candidate }
         });
       }
     }

@@ -14,6 +14,22 @@ export interface NormalizedInboundMessage {
   content: Record<string, unknown>;
 }
 
+export interface NormalizedMessageEcho {
+  provider: ChannelProvider;
+  channelExternalId: string;
+  recipientExternalId: string;
+  externalMessageId: string;
+  timestamp: string;
+  type: string;
+  text?: string;
+  /** Complete echo, including media metadata and reply context when supplied. */
+  content: Record<string, unknown>;
+}
+
+export interface MessageEchoRepository {
+  ingestOutboundMessage(message: NormalizedMessageEcho): Promise<{ duplicate: boolean }>;
+}
+
 export interface IngestedMessageContext {
   duplicate: boolean;
   companyId: string;
